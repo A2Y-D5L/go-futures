@@ -79,18 +79,20 @@ func NewManager(pool Pool, opts ...ManagerOption) *Manager {
 	return m
 }
 
-// Close performs a deterministic global shutdown:
-//   1) Flip global closed gate (reject future requests).
-//   2) Wait for all in-flight manager enqueuers to exit.
-//   3) Close every registered service (each will drain and wait its inflight).
+// Close is the manager-wide shutdown sequence that implements Option A coordination:
+//   1) Reject future enqueues via gate.CloseAndWait (global stop-the-world).
+//   2) Wait for all in-flight enqueuers to finish before proceeding.
+//   3) Close every registered service sequentially (each will drain and wait its inflight).
 //   4) Optionally close the shared pool (if Manager owns it).
 // Close is idempotent and safe for concurrent use.
 func (m *Manager) Close() {
 	m.closeOnce.Do(func() {
-		// 1-2) Reject future enqueues and wait for enqueuers to exit.
+		// Step 1: Global stop-the-world - block new requests and wait for in-flight enqueuers
 		m.gate.CloseAndWait()
 
-		// 3) Close all services. We do this under a snapshot to avoid holding the lock while closing.
+		// Step 2: Close all services to drain their reqCh
+		// (Safe because step 1 guarantees no concurrent writers)
+		// In Option A, we close services sequentially to maintain clear coordination
 		var toClose []*entry
 		m.mu.RLock()
 		for _, e := range m.svcs {
@@ -98,18 +100,12 @@ func (m *Manager) Close() {
 		}
 		m.mu.RUnlock()
 
-		var wg sync.WaitGroup
-		wg.Add(len(toClose))
+		// Close services sequentially for Option A coordination
 		for _, e := range toClose {
-			// Close services in parallel to reduce tail latency on shutdown.
-			go func(e *entry) {
-				defer wg.Done()
-				e.closeFn()
-			}(e)
+			e.closeFn()
 		}
-		wg.Wait()
 
-		// 4) Finally close the pool if we own it.
+		// Step 3: Close the pool (drains remaining jobs and joins workers)
 		if m.ownsPool {
 			// The Pool implementation is expected to drain already-enqueued jobs.
 			// At this point, services have stopped submitting new work.
@@ -257,7 +253,14 @@ func (m *Manager) Enable(name string) bool {
 }
 
 // Unregister disables, closes, and removes the named service. Returns false if not found.
+// Uses Manager.gate to ensure no registration changes during shutdown.
 func (m *Manager) Unregister(name string) bool {
+	// Manager.gate ensures no registration changes during shutdown
+	if !m.gate.Enter() {
+		return false // Manager is closing/closed
+	}
+	defer m.gate.Exit()
+
 	// Snapshot the entry under lock.
 	m.mu.Lock()
 	e, ok := m.svcs[name]
@@ -273,7 +276,7 @@ func (m *Manager) Unregister(name string) bool {
 	e.disabled = true
 	e.mu.Unlock()
 
-	// Close the service.
+	// Close the service (flips atomic flag and drains)
 	e.closeFn()
 
 	// Fire hooks.

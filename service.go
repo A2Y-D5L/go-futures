@@ -39,8 +39,9 @@ type Service[I any, O any] struct {
 	//   • Preserve deterministic drain semantics at Close() (we can fail leftovers).
 	reqCh chan request[I, O] // Intentionally never closed by Request(); drained by Close().
 
-	// Broadcast: signals shutdown to internal dispatchers and cancels Submit waits.
-	done chan struct{}
+	// Context-based broadcast: signals shutdown to internal dispatchers and cancels Submit waits.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
 
 	// Tracks jobs that have been successfully submitted to the pool and will run.
 	jobsWG sync.WaitGroup
@@ -48,8 +49,8 @@ type Service[I any, O any] struct {
 	// Tracks internal dispatcher goroutines.
 	dispatchWG sync.WaitGroup
 
-	// gate provides unified enqueue window coordination.
-	gate
+	// Lightweight atomic flag for direct call protection (replaces gate)
+	closed atomic.Bool
 
 	// closeOnce ensures Close is idempotent.
 	closeOnce sync.Once
@@ -104,8 +105,10 @@ func New[I any, O any](pool Pool, qsize int, process func(context.Context, I) (O
 		process: process,
 		pool:    pool,
 		reqCh:   make(chan request[I, O], qsize),
-		done:    make(chan struct{}),
 	}
+
+	// Initialize context for shutdown signaling
+	s.stopCtx, s.stopCancel = context.WithCancel(context.Background())
 
 	// Initialize metrics
 	s.startTime = time.Now()
@@ -137,16 +140,15 @@ func New[I any, O any](pool Pool, qsize int, process func(context.Context, I) (O
 //   - Otherwise the request is enqueued and later dispatched to the pool; the result is delivered on the channel.
 //   - The returned channel is closed after sending the single Response.
 //
-// ENQUEUE GATE (critical to correctness):
-//   - We hold mu.RLock() to read "closed" and (if open) increment enqWG before attempting to enqueue.
-//     This prevents Close() from flipping "closed" between the check and enqWG.Add(1).
-//   - Close() flips "closed" under mu.Lock(), then waits for enqWG to reach zero. That guarantees
-//     there are no writers racing with the subsequent drain.
+// Option A Design Notes:
+//   - Manager.gate provides global admission control for all services
+//   - Service uses lightweight atomic.Bool for direct call protection
+//   - Close() assumes Manager.gate.CloseAndWait() has eliminated concurrent enqueuers
 func (s *Service[I, O]) Request(ctx context.Context, in I) <-chan Response[O] {
 	out := make(chan Response[O], 1) // single-value future
 
 	// Fast-path rejections: closed or already-canceled context.
-	if s.gate.IsClosed() {
+	if s.closed.Load() {
 		out <- Response[O]{Err: ErrClosed}
 		close(out)
 		return out
@@ -157,24 +159,23 @@ func (s *Service[I, O]) Request(ctx context.Context, in I) <-chan Response[O] {
 		return out
 	}
 
-	// Enter the ENQUEUE WINDOW: count ourselves so Close() can wait for us.
-	if !s.gate.Enter() {
-		// Close might have flipped while we raced between the previous RUnlock and this RLock.
+	// Note: In Option A, Manager.gate provides global admission control.
+	// This atomic check provides lightweight protection for direct Service calls.
+	if s.closed.Load() {
 		out <- Response[O]{Err: ErrClosed}
 		close(out)
 		return out
 	}
-	defer s.gate.Exit()
 
 	req := request[I, O]{ctx: ctx, in: in, out: out, start: time.Now()}
 	s.enqueueCount.Add(1)
 
-	// Stage 2: attempt to enqueue or fail if shutdown/cancel occurs.
+	// Attempt to enqueue or fail if shutdown/cancel occurs.
 	// This select provides backpressure when the queue is full.
 	select {
 	case s.reqCh <- req:
 		// Enqueued successfully; the dispatcher (or the drainer during Close) will deliver the reply.
-	case <-s.done:
+	case <-s.stopCtx.Done():
 		// Shutdown began; reject this request.
 		s.fail(req, ErrClosed)
 	case <-ctx.Done():
@@ -193,19 +194,22 @@ func (s *Service[I, O]) Request(ctx context.Context, in I) <-chan Response[O] {
 // IMPORTANT: reqCh remains OPEN to callers at all times; we coordinate a safe shutdown by:
 //  1. Flipping closed=true (reject future Request()).
 //  2. Waiting for all in-flight enqueuers (enqWG) to finish Stage-2.
-//  3. Signaling internal dispatchers via done (they stop selecting reqCh; any Submit waits get canceled).
+//  3. Signaling internal dispatchers via stopCancel (they stop selecting reqCh; any Submit waits get canceled).
 //  4. Draining reqCh deterministically and failing leftover requests with ErrClosed.
 //  5. Waiting for dispatcher(s) to exit and for any already-submitted jobs to the pool to finish.
 func (s *Service[I, O]) Close() {
 	s.closeOnce.Do(func() {
-		// 1-2) Reject future enqueues and wait for enqueuers to exit.
-		s.gate.CloseAndWait()
+		// Set atomic flag first
+		s.closed.Store(true)
 
-		// 3) Tell dispatchers to wind down (they stop picking new work ASAP).
-		close(s.done)
+		// Cancel context (replaces close(s.done))
+		s.stopCancel()
 
-		// 4) Drain any leftover requests deterministically.
-		//    Because (a) closed=true and (b) enqWG==0, there can be no further writers to reqCh.
+		// No gate operations needed - Manager.gate.CloseAndWait() 
+		// guarantees no concurrent enqueuers when called via Manager
+
+		// Drain any leftover requests deterministically.
+		// Because Manager ensures no concurrent writers, we can safely drain reqCh.
 		for {
 			select {
 			case req := <-s.reqCh:
@@ -216,10 +220,10 @@ func (s *Service[I, O]) Close() {
 		}
 	drained:
 
-		// 5a) Wait for dispatcher(s) to exit (ensures no more Submit attempts are in flight).
+		// Wait for dispatcher(s) to exit (ensures no more Submit attempts are in flight).
 		s.dispatchWG.Wait()
 
-		// 5b) Wait for any already-submitted jobs (to the shared pool) to finish.
+		// Wait for any already-submitted jobs (to the shared pool) to finish.
 		s.jobsWG.Wait()
 	})
 }
@@ -235,7 +239,7 @@ func (s *Service[I, O]) dispatch() {
 
 	for {
 		select {
-		case <-s.done:
+		case <-s.stopCtx.Done():
 			// Stop selecting reqCh; Close() will do a deterministic drain.
 			return
 		case req := <-s.reqCh:
@@ -244,7 +248,7 @@ func (s *Service[I, O]) dispatch() {
 			// Ensure this helper goroutine terminates regardless of path taken.
 			go func() {
 				select {
-				case <-s.done:
+				case <-s.stopCtx.Done():
 					cancel() // Cancel Submit when Service closes.
 				case <-ctxSubmit.Done():
 					// Caller canceled or job already submitted and completed (cancel called in job).
@@ -335,7 +339,7 @@ func (s *Service[I, O]) fail(req request[I, O], err error) {
 
 // isClosed reports whether the service has begun closing.
 func (s *Service[I, O]) isClosed() bool {
-	return s.gate.IsClosed()
+	return s.closed.Load()
 }
 
 // Stats returns a snapshot of the service's current state.
@@ -373,7 +377,7 @@ func (s *Service[I, O]) Stats() ServiceStats {
 		QueueDepth:       len(s.reqCh),
 		QueueCapacity:    cap(s.reqCh),
 		InflightJobs:     s.inflightJobs.Load(),
-		Closed:           s.gate.IsClosed(),
+		Closed:           s.closed.Load(),
 		Disabled:         false, // Service-level disable not supported; this is manager-level
 		QueueUtilization: queueUtil,
 		EnqueueRate:      enqueueRate,
